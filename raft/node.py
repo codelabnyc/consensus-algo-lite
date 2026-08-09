@@ -25,6 +25,7 @@ LEADER = "LEADER"
 
 @dataclass
 class Entry:
+    """One log entry: a command plus the term it was created in."""
     term: int
     command: Any
 
@@ -32,6 +33,7 @@ class Entry:
 # --- RPC messages --------------------------------------------------------
 @dataclass
 class RequestVote:
+    """A candidate asking its peers for a vote."""
     term: int
     candidate_id: int
     last_log_index: int
@@ -40,12 +42,14 @@ class RequestVote:
 
 @dataclass
 class RequestVoteResp:
+    """A peer's yes/no answer to a vote request."""
     term: int
     vote_granted: bool
 
 
 @dataclass
 class AppendEntries:
+    """Leader -> follower: replicate entries (empty list == heartbeat)."""
     term: int
     leader_id: int
     prev_log_index: int
@@ -56,6 +60,7 @@ class AppendEntries:
 
 @dataclass
 class AppendEntriesResp:
+    """A follower's answer to AppendEntries (and how far its log now matches)."""
     term: int
     success: bool
     match_index: int = 0
@@ -69,53 +74,64 @@ class Node:
         self.peers = list(peers)
         self.network = network
         self.clock = clock
-        self.rng = rng
-        self.sm = state_machine
+        self.rng = rng           # seeded random number generator (election timeouts)
+        self.sm = state_machine  # the state machine we replicate (key-value store)
 
-        # Persistent state in real Raft (kept in memory here -- persistence is
-        # listed as future work; that is exactly why a crash that loses this
-        # state is unsafe without it).
+        # In real Raft these 3 would be saved to disk so they survive a restart.
+        # We keep them in memory to stay simple (saving to disk = beyond scope of this project).
+        # If a node crashed and forgot these, it could break Raft's rules --
+        # e.g. vote for two different candidates and wrongly create two leaders.
+        # This is why a real-life implementation would save these somewhere persistent.
         self.current_term = 0
         self.voted_for = None
         self.log = [Entry(term=0, command=None)]  # index 0 = sentinel
 
-        # Volatile state.
+        # Volatile state (values a node can safely rebuild after a restart).
         self.role = FOLLOWER
-        self.commit_index = 0
-        self.last_applied = 0
-        self.leader_id = None
-        self.votes = set()
+        self.commit_index = 0    # highest log entry known to be safely committed
+        self.last_applied = 0    # highest log entry already applied to the KV store
+        self.leader_id = None    # who we think the leader is (None if unknown)
+        self.votes = set()       # who voted for me this election (only as candidate)
 
-        # Leader-only volatile state.
-        self.next_index = {}
-        self.match_index = {}
+        # Leader-only volatile state (per-follower bookkeeping).
+        self.next_index = {}     # for each follower: next log index to send them
+        self.match_index = {}    # for each follower: highest index known to be on them
 
         # Timers.
-        self.min_election_timeout = min_election_timeout
-        self.max_election_timeout = max_election_timeout
-        self.heartbeat_interval = heartbeat_interval
-        self.next_heartbeat = 0.0
-        self.last_leader_contact = -1e9  # for leader stickiness
-        self.up = True
-        self.reset_election_deadline()
+        self.min_election_timeout = min_election_timeout  # min wait before an election
+        self.max_election_timeout = max_election_timeout  # max wait (randomized in range)
+        self.heartbeat_interval = heartbeat_interval  # how often the leader heartbeats
+        self.next_heartbeat = 0.0  # when the leader should send its next heartbeat
+        self.last_leader_contact = -1e9  # when we last heard from a leader (stickiness)
+        self.up = True  # is this node alive? (False = crashed)
+        self.reset_election_deadline()  # set the first random election deadline
 
     # --- small helpers ---------------------------------------------------
     def now(self):
+        """Current time, read from the injected clock."""
         return self.clock.now()
 
     def last_log_index(self):
+        """Index of the last log entry (0 when only the sentinel exists)."""
         return len(self.log) - 1
 
     def last_log_term(self):
+        """Term of the last log entry."""
         return self.log[-1].term
 
     def majority(self):
+        """How many nodes form a majority of the whole cluster."""
         return (len(self.peers) + 1) // 2 + 1
 
     def send(self, dst, msg):
+        """Send a message to another node (fills in src = me)."""
         self.network.send(self.id, dst, msg)
 
     def reset_election_deadline(self):
+        """Pick a fresh, randomized election timeout starting from now.
+
+        Randomizing avoids everyone timing out together (split votes).
+        """
         span = self.rng.uniform(self.min_election_timeout, self.max_election_timeout)
         self.election_deadline = self.now() + span
 
@@ -129,6 +145,7 @@ class Node:
         self.reset_election_deadline()
 
     def become_leader(self):
+        """Win the election: set up follower tracking and heartbeat immediately."""
         self.role = LEADER
         self.leader_id = self.id
         for p in self.peers:
@@ -138,6 +155,7 @@ class Node:
         self.next_heartbeat = self.now()  # heartbeat on this tick
 
     def start_election(self):
+        """Become a candidate, bump the term, and ask every peer for a vote."""
         self.role = CANDIDATE
         self.current_term += 1
         self.voted_for = self.id
@@ -152,6 +170,11 @@ class Node:
 
     # --- driven by the harness ------------------------------------------
     def tick(self):
+        """One time step: leaders heartbeat, others may start an election.
+
+        Called by the harness once per simulated step. Also applies any
+        newly-committed entries to the state machine.
+        """
         if not self.up:
             return
         now = self.now()
@@ -165,6 +188,7 @@ class Node:
         self.apply_committed()
 
     def receive(self, src, msg):
+        """Dispatch an incoming message to the matching handler."""
         if not self.up:
             return
         if isinstance(msg, RequestVote):
@@ -178,6 +202,7 @@ class Node:
 
     # --- elections -------------------------------------------------------
     def handle_request_vote(self, src, m):
+        """Decide whether to grant a candidate our vote."""
         # Leader stickiness: if a leader is still alive to us, refuse to vote.
         # This stops a node cut off from the leader (but not from us) from
         # forcing a needless election. We reject WITHOUT adopting the higher
@@ -208,6 +233,7 @@ class Node:
             self.send(src, RequestVoteResp(self.current_term, False))
 
     def handle_request_vote_resp(self, src, m):
+        """Count a vote reply; become leader once a majority say yes."""
         if m.term > self.current_term:
             self.advance_term(m.term)
             return
@@ -220,6 +246,7 @@ class Node:
 
     # --- log replication -------------------------------------------------
     def send_append_entries(self, dst):
+        """Send a follower the entries it's missing (empty == heartbeat)."""
         ni = self.next_index.get(dst, self.last_log_index() + 1)
         prev_index = ni - 1
         prev_term = self.log[prev_index].term
@@ -234,6 +261,7 @@ class Node:
         ))
 
     def handle_append_entries(self, src, m):
+        """Handle the leader's replication/heartbeat; append entries, update commit."""
         if m.term < self.current_term:
             self.send(src, AppendEntriesResp(self.current_term, False))
             return
@@ -270,6 +298,7 @@ class Node:
             self.current_term, True, m.prev_log_index + len(m.entries)))
 
     def handle_append_entries_resp(self, src, m):
+        """Handle a follower's reply: advance commit on success, or retry further back."""
         if m.term > self.current_term:
             self.advance_term(m.term)
             return
@@ -284,6 +313,7 @@ class Node:
             self.send_append_entries(src)  # retry further back
 
     def maybe_advance_commit(self):
+        """Commit the highest entry stored on a majority (own-term entries only)."""
         # Advance commit_index to the highest N replicated on a majority -- but
         # only for entries from our own term (Raft's commitment rule, which
         # fixes a subtle safety bug from the paper's first version).
@@ -296,6 +326,7 @@ class Node:
                 break
 
     def apply_committed(self):
+        """Apply newly-committed entries to the state machine, in log order."""
         while self.last_applied < self.commit_index:
             self.last_applied += 1
             self.sm.apply(self.log[self.last_applied].command)
