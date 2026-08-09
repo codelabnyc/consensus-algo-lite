@@ -39,14 +39,14 @@ class Cluster:
             self.network.register(node)
 
     def step(self, dt=10):
-        self.clock.advance(dt)
-        self.network.deliver_due()
-        for node in self.nodes.values():
+        self.clock.advance(dt)              # time passes
+        self.network.deliver_due()          # Deliver every message whose time has arrived.
+        for node in self.nodes.values():    # every node reacts
             node.tick()
 
     def run(self, duration, dt=10):
         end = self.clock.now() + duration
-        while self.clock.now() < end:
+        while self.clock.now() < end:       # keep stepping until enough time passed
             self.step(dt)
 
     def run_until(self, predicate, max_steps=2000, dt=10):
@@ -58,12 +58,15 @@ class Cluster:
 
     # --- inspection helpers ---------------------------------------------
     def live_nodes(self):
+        """Nodes that are up AND not cut off."""
         return [n for n in self.nodes.values()
                 if n.up and n.id not in self.network.isolated]
 
     def leaders(self):
+        """Which live nodes think they're leader."""
         return [n for n in self.live_nodes() if n.role == LEADER]
 
     def leader(self):
+        """Grab the one leader, or None."""
         ls = self.leaders()
         return ls[0] if ls else None
