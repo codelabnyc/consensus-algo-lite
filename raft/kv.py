@@ -11,6 +11,12 @@ class KV:
         self.data = {}
 
     def apply(self, command):
+        """Run one command against the store.
+
+        `command` is a dict describing the operation, e.g.
+            {"op": "put", "key": "x", "value": 1}   -> set x = 1
+            {"op": "delete", "key": "x"}            -> remove x
+        """
         op = command["op"]
         if op == "put":
             self.data[command["key"]] = command["value"]
@@ -21,4 +27,5 @@ class KV:
         return self.data.get(command.get("key"))
 
     def get(self, key):
+        """Read a key's value, or None if it's missing."""
         return self.data.get(key)
