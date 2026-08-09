@@ -18,6 +18,7 @@ class Clock:
         return self._now
 
     def advance(self, dt):
+        """Move time forward by dt (delta time)."""
         if dt < 0:
             raise ValueError("time only moves forward")
         self._now += dt
